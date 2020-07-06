@@ -3,7 +3,6 @@ package queue
 import (
 	"net/url"
 	"sync"
-	"sync/atomic"
 
 	"github.com/gocolly/colly/v2"
 )
@@ -11,6 +10,7 @@ import (
 const stop = true
 
 // Storage is the interface of the queue's storage backend
+// Storage must be concurrently safe for multiple goroutines.
 type Storage interface {
 	// Init initializes the storage
 	Init() error
@@ -27,11 +27,10 @@ type Storage interface {
 // requests in multiple threads
 type Queue struct {
 	// Threads defines the number of consumer threads
-	Threads           int
-	storage           Storage
-	activeThreadCount int32
-	threadChans       []chan bool
-	lock              *sync.Mutex
+	Threads int
+	storage Storage
+	wake    chan struct{}
+	mut     sync.Mutex // guards wake
 }
 
 // InMemoryQueueStorage is the default implementation of the Storage interface.
@@ -61,10 +60,8 @@ func New(threads int, s Storage) (*Queue, error) {
 		return nil, err
 	}
 	return &Queue{
-		Threads:     threads,
-		storage:     s,
-		lock:        &sync.Mutex{},
-		threadChans: make([]chan bool, 0, threads),
+		Threads: threads,
+		storage: s,
 	}, nil
 }
 
@@ -93,20 +90,26 @@ func (q *Queue) AddURL(URL string) error {
 
 // AddRequest adds a new Request to the queue
 func (q *Queue) AddRequest(r *colly.Request) error {
+	q.mut.Lock()
+	waken := q.wake != nil
+	q.mut.Unlock()
+	if !waken {
+		return q.storeRequest(r)
+	}
+	err := q.storeRequest(r)
+	if err != nil {
+		return err
+	}
+	q.wake <- struct{}{}
+	return nil
+}
+
+func (q *Queue) storeRequest(r *colly.Request) error {
 	d, err := r.Marshal()
 	if err != nil {
 		return err
 	}
-	if err := q.storage.AddRequest(d); err != nil {
-		return err
-	}
-	q.lock.Lock()
-	for _, c := range q.threadChans {
-		c <- !stop
-	}
-	q.threadChans = make([]chan bool, 0, q.Threads)
-	q.lock.Unlock()
-	return nil
+	return q.storage.AddRequest(d)
 }
 
 // Size returns the size of the queue
@@ -116,56 +119,88 @@ func (q *Queue) Size() (int, error) {
 
 // Run starts consumer threads and calls the Collector
 // to perform requests. Run blocks while the queue has active requests
+// The given Storage must not be used directly while Run blocks.
 func (q *Queue) Run(c *colly.Collector) error {
-	wg := &sync.WaitGroup{}
-	for i := 0; i < q.Threads; i++ {
-		wg.Add(1)
-		go func(c *colly.Collector, wg *sync.WaitGroup) {
-			defer wg.Done()
-			for {
-				if q.IsEmpty() {
-					if q.activeThreadCount == 0 {
-						break
-					}
-					ch := make(chan bool)
-					q.lock.Lock()
-					q.threadChans = append(q.threadChans, ch)
-					q.lock.Unlock()
-					action := <-ch
-					if action == stop && q.IsEmpty() {
-						break
-					}
-				}
-				q.lock.Lock()
-				atomic.AddInt32(&q.activeThreadCount, 1)
-				q.lock.Unlock()
-				rb, err := q.storage.GetRequest()
-				if err != nil || rb == nil {
-					q.finish()
-					continue
-				}
-				r, err := c.UnmarshalRequest(rb)
-				if err != nil || r == nil {
-					q.finish()
-					continue
-				}
-				r.Do()
-				q.finish()
-			}
-		}(c, wg)
+	q.mut.Lock()
+	if q.wake != nil {
+		q.mut.Unlock()
+		panic("cannot call duplicate Queue.Run")
 	}
-	wg.Wait()
-	return nil
+	q.wake = make(chan struct{})
+	q.mut.Unlock()
+
+	requestc := make(chan *colly.Request)
+	complete, errc := make(chan struct{}), make(chan error, 1)
+	for i := 0; i < q.Threads; i++ {
+		go independentRunner(requestc, complete)
+	}
+	go q.loop(c, requestc, complete, errc)
+	defer close(requestc)
+	return <-errc
 }
 
-func (q *Queue) finish() {
-	q.lock.Lock()
-	q.activeThreadCount--
-	for _, c := range q.threadChans {
-		c <- stop
+func (q *Queue) loop(c *colly.Collector, requestc chan<- *colly.Request, complete <-chan struct{}, errc chan<- error) {
+	var active int
+	for {
+		size, err := q.storage.QueueSize()
+		if err != nil {
+			errc <- err
+			break
+		}
+		if size == 0 && active == 0 {
+			// Terminate when
+			//   1. No active requests
+			//   2. Emtpy queue
+			errc <- nil
+			break
+		}
+		sent := requestc
+		var req *colly.Request
+		if size > 0 {
+			req, err = q.loadRequest(c)
+			if err != nil {
+				// ignore an error returned by GetRequest() or
+				// UnmarshalRequest()
+				continue
+			}
+		} else {
+			sent = nil
+		}
+	Sent:
+		for {
+			select {
+			case sent <- req:
+				active++
+				break Sent
+			case <-q.wake:
+				if sent == nil {
+					break Sent
+				}
+			case <-complete:
+				active--
+				if sent == nil && active == 0 {
+					break Sent
+				}
+			}
+		}
 	}
-	q.threadChans = make([]chan bool, 0, q.Threads)
-	q.lock.Unlock()
+}
+
+func independentRunner(requestc <-chan *colly.Request, complete chan<- struct{}) {
+	for req := range requestc {
+		req.Do()
+		complete <- struct{}{}
+	}
+}
+
+func (q *Queue) loadRequest(c *colly.Collector) (*colly.Request, error) {
+	buf, err := q.storage.GetRequest()
+	if err != nil {
+		return nil, err
+	}
+	copied := make([]byte, len(buf))
+	copy(copied, buf)
+	return c.UnmarshalRequest(copied)
 }
 
 // Init implements Storage.Init() function
@@ -180,7 +215,7 @@ func (q *InMemoryQueueStorage) AddRequest(r []byte) error {
 	defer q.lock.Unlock()
 	// Discard URLs if size limit exceeded
 	if q.MaxSize > 0 && q.size >= q.MaxSize {
-		return nil
+		return colly.ErrQueueFull
 	}
 	i := &inMemoryQueueItem{Request: r}
 	if q.first == nil {

@@ -15,10 +15,12 @@
 package colly
 
 import (
+	"bufio"
 	"bytes"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"reflect"
 	"regexp"
@@ -135,6 +137,33 @@ func newTestServer() *httptest.Server {
 </body>
 </html>
 		`))
+	})
+
+	mux.HandleFunc("/base_relative", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.Write([]byte(`<!DOCTYPE html>
+<html>
+<head>
+<title>Test Page</title>
+<base href="/foobar/" />
+</head>
+<body>
+<a href="z">link</a>
+</body>
+</html>
+		`))
+	})
+
+	mux.HandleFunc("/large_binary", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		ww := bufio.NewWriter(w)
+		defer ww.Flush()
+		for {
+			// have to check error to detect client aborting download
+			if _, err := ww.Write([]byte{0x41}); err != nil {
+				return
+			}
+		}
 	})
 
 	return httptest.NewServer(mux)
@@ -286,6 +315,20 @@ var newCollectorTests = map[string]func(*testing.T){
 			t.Fatalf("c.debugger = %v, want %v", got, want)
 		}
 	},
+	"CheckHead": func(t *testing.T) {
+		c := NewCollector(CheckHead())
+
+		if !c.CheckHead {
+			t.Fatal("c.CheckHead = false, want true")
+		}
+	},
+	"Async": func(t *testing.T) {
+		c := NewCollector(Async())
+
+		if !c.Async {
+			t.Fatal("c.Async = false, want true")
+		}
+	},
 }
 
 func TestNewCollector(t *testing.T) {
@@ -387,6 +430,28 @@ func TestCollectorVisitWithDisallowedDomains(t *testing.T) {
 	}
 }
 
+func TestCollectorVisitResponseHeaders(t *testing.T) {
+	ts := newTestServer()
+	defer ts.Close()
+
+	var onResponseHeadersCalled bool
+
+	c := NewCollector()
+	c.OnResponseHeaders(func(r *Response) {
+		onResponseHeadersCalled = true
+		if r.Headers.Get("Content-Type") == "application/octet-stream" {
+			r.Request.Abort()
+		}
+	})
+	c.OnResponse(func(r *Response) {
+		t.Error("OnResponse was called")
+	})
+	c.Visit(ts.URL + "/large_binary")
+	if !onResponseHeadersCalled {
+		t.Error("OnResponseHeaders was not called")
+	}
+}
+
 func TestCollectorOnHTML(t *testing.T) {
 	ts := newTestServer()
 	defer ts.Close()
@@ -460,6 +525,45 @@ func TestCollectorURLRevisit(t *testing.T) {
 	}
 }
 
+func TestCollectorPostRevisit(t *testing.T) {
+	ts := newTestServer()
+	defer ts.Close()
+
+	postValue := "hello"
+	postData := map[string]string{
+		"name": postValue,
+	}
+	visitCount := 0
+
+	c := NewCollector()
+	c.OnResponse(func(r *Response) {
+		if postValue != string(r.Body) {
+			t.Error("Failed to send data with POST")
+		}
+		visitCount++
+	})
+
+	c.Post(ts.URL+"/login", postData)
+	c.Post(ts.URL+"/login", postData)
+	c.Post(ts.URL+"/login", map[string]string{
+		"name":     postValue,
+		"lastname": "world",
+	})
+
+	if visitCount != 2 {
+		t.Error("URL POST revisited")
+	}
+
+	c.AllowURLRevisit = true
+
+	c.Post(ts.URL+"/login", postData)
+	c.Post(ts.URL+"/login", postData)
+
+	if visitCount != 4 {
+		t.Error("URL POST not revisited")
+	}
+}
+
 func TestCollectorURLRevisitCheck(t *testing.T) {
 	ts := newTestServer()
 	defer ts.Close()
@@ -489,6 +593,85 @@ func TestCollectorURLRevisitCheck(t *testing.T) {
 	}
 }
 
+func TestCollectorPostURLRevisitCheck(t *testing.T) {
+	ts := newTestServer()
+	defer ts.Close()
+
+	c := NewCollector()
+
+	postValue := "hello"
+	postData := map[string]string{
+		"name": postValue,
+	}
+
+	posted, err := c.HasPosted(ts.URL+"/login", postData)
+
+	if err != nil {
+		t.Error(err.Error())
+	}
+
+	if posted != false {
+		t.Error("Expected URL to NOT have been visited")
+	}
+
+	c.Post(ts.URL+"/login", postData)
+
+	posted, err = c.HasPosted(ts.URL+"/login", postData)
+
+	if err != nil {
+		t.Error(err.Error())
+	}
+
+	if posted != true {
+		t.Error("Expected URL to have been visited")
+	}
+
+	postData["lastname"] = "world"
+	posted, err = c.HasPosted(ts.URL+"/login", postData)
+
+	if err != nil {
+		t.Error(err.Error())
+	}
+
+	if posted != false {
+		t.Error("Expected URL to NOT have been visited")
+	}
+
+	c.Post(ts.URL+"/login", postData)
+
+	posted, err = c.HasPosted(ts.URL+"/login", postData)
+
+	if err != nil {
+		t.Error(err.Error())
+	}
+
+	if posted != true {
+		t.Error("Expected URL to have been visited")
+	}
+}
+
+// TestCollectorURLRevisitDisallowed ensures that disallowed URL is not considered visited.
+func TestCollectorURLRevisitDomainDisallowed(t *testing.T) {
+	ts := newTestServer()
+	defer ts.Close()
+
+	parsedURL, err := url.Parse(ts.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c := NewCollector(DisallowedDomains(parsedURL.Hostname()))
+	err = c.Visit(ts.URL)
+	if got, want := err, ErrForbiddenDomain; got != want {
+		t.Fatalf("wrong error on first visit: got=%v want=%v", got, want)
+	}
+	err = c.Visit(ts.URL)
+	if got, want := err, ErrForbiddenDomain; got != want {
+		t.Fatalf("wrong error on second visit: got=%v want=%v", got, want)
+	}
+
+}
+
 func TestCollectorPost(t *testing.T) {
 	ts := newTestServer()
 	defer ts.Close()
@@ -505,6 +688,56 @@ func TestCollectorPost(t *testing.T) {
 	c.Post(ts.URL+"/login", map[string]string{
 		"name": postValue,
 	})
+}
+
+func TestCollectorPostRaw(t *testing.T) {
+	ts := newTestServer()
+	defer ts.Close()
+
+	postValue := "hello"
+	c := NewCollector()
+
+	c.OnResponse(func(r *Response) {
+		if postValue != string(r.Body) {
+			t.Error("Failed to send data with POST")
+		}
+	})
+
+	c.PostRaw(ts.URL+"/login", []byte("name="+postValue))
+}
+
+func TestCollectorPostRawRevisit(t *testing.T) {
+	ts := newTestServer()
+	defer ts.Close()
+
+	postValue := "hello"
+	postData := "name=" + postValue
+	visitCount := 0
+
+	c := NewCollector()
+	c.OnResponse(func(r *Response) {
+		if postValue != string(r.Body) {
+			t.Error("Failed to send data with POST RAW")
+		}
+		visitCount++
+	})
+
+	c.PostRaw(ts.URL+"/login", []byte(postData))
+	c.PostRaw(ts.URL+"/login", []byte(postData))
+	c.PostRaw(ts.URL+"/login", []byte(postData+"&lastname=world"))
+
+	if visitCount != 2 {
+		t.Error("URL POST RAW revisited")
+	}
+
+	c.AllowURLRevisit = true
+
+	c.PostRaw(ts.URL+"/login", []byte(postData))
+	c.PostRaw(ts.URL+"/login", []byte(postData))
+
+	if visitCount != 4 {
+		t.Error("URL POST RAW not revisited")
+	}
 }
 
 func TestRedirect(t *testing.T) {
@@ -547,6 +780,31 @@ func TestBaseTag(t *testing.T) {
 		}
 	})
 	c2.Visit(ts.URL + "/base")
+}
+
+func TestBaseTagRelative(t *testing.T) {
+	ts := newTestServer()
+	defer ts.Close()
+
+	c := NewCollector()
+	c.OnHTML("a[href]", func(e *HTMLElement) {
+		u := e.Request.AbsoluteURL(e.Attr("href"))
+		expected := ts.URL + "/foobar/z"
+		if u != expected {
+			t.Errorf("Invalid <base /> tag handling in OnHTML: expected %q, got %q", expected, u)
+		}
+	})
+	c.Visit(ts.URL + "/base_relative")
+
+	c2 := NewCollector()
+	c2.OnXML("//a", func(e *XMLElement) {
+		u := e.Request.AbsoluteURL(e.Attr("href"))
+		expected := ts.URL + "/foobar/z"
+		if u != expected {
+			t.Errorf("Invalid <base /> tag handling in OnXML: expected %q, got %q", expected, u)
+		}
+	})
+	c2.Visit(ts.URL + "/base_relative")
 }
 
 func TestCollectorCookies(t *testing.T) {
@@ -787,6 +1045,42 @@ func TestCollectorOnXML(t *testing.T) {
 
 	if paragraphCallbackCount != 2 {
 		t.Error("Failed to find all <p> tags")
+	}
+}
+
+func TestCollectorVisitWithTrace(t *testing.T) {
+	ts := newTestServer()
+	defer ts.Close()
+
+	c := NewCollector(AllowedDomains("localhost", "127.0.0.1", "::1"), TraceHTTP())
+	c.OnResponse(func(resp *Response) {
+		if resp.Trace == nil {
+			t.Error("Failed to initialize trace")
+		}
+	})
+
+	err := c.Visit(ts.URL)
+	if err != nil {
+		t.Errorf("Failed to visit url %s", ts.URL)
+	}
+}
+
+func TestCollectorVisitWithCheckHead(t *testing.T) {
+	ts := newTestServer()
+	defer ts.Close()
+
+	c := NewCollector(CheckHead())
+	var requestMethodChain []string
+	c.OnResponse(func(resp *Response) {
+		requestMethodChain = append(requestMethodChain, resp.Request.Method)
+	})
+
+	err := c.Visit(ts.URL)
+	if err != nil {
+		t.Errorf("Failed to visit url %s", ts.URL)
+	}
+	if requestMethodChain[0] != "HEAD" && requestMethodChain[1] != "GET" {
+		t.Errorf("Failed to perform a HEAD request before GET")
 	}
 }
 
