@@ -45,6 +45,7 @@ import (
 	"github.com/gocolly/colly/v2/storage"
 	"github.com/kennygrant/sanitize"
 	"github.com/temoto/robotstxt"
+	"github.com/tidwall/gjson"
 	"google.golang.org/appengine/urlfetch"
 )
 
@@ -112,6 +113,7 @@ type Collector struct {
 	robotsMap         map[string]*robotstxt.RobotsData
 	htmlCallbacks     []*htmlCallbackContainer
 	xmlCallbacks      []*xmlCallbackContainer
+	jsonCallbacks     []*jsonCallbackContainer
 	requestCallbacks  []RequestCallback
 	responseCallbacks []ResponseCallback
 	errorCallbacks    []ErrorCallback
@@ -131,6 +133,9 @@ type ResponseCallback func(*Response)
 
 // HTMLCallback is a type alias for OnHTML callback functions
 type HTMLCallback func(*HTMLElement)
+
+//JSONCallback is a type alias for OnJson callback functions
+type JSONCallback func(*JSONElement)
 
 // XMLCallback is a type alias for OnXML callback functions
 type XMLCallback func(*XMLElement)
@@ -152,6 +157,11 @@ type htmlCallbackContainer struct {
 type xmlCallbackContainer struct {
 	Query    string
 	Function XMLCallback
+}
+
+type jsonCallbackContainer struct {
+	Selector string
+	Function JSONCallback
 }
 
 type cookieJarSerializer struct {
@@ -636,6 +646,11 @@ func (c *Collector) fetch(u, method string, depth int, requestData io.Reader, ct
 
 	c.handleOnResponse(response)
 
+	err = c.handleOnJSON(response)
+	if err != nil {
+		c.handleOnError(response, err, request, ctx)
+	}
+
 	err = c.handleOnHTML(response)
 	if err != nil {
 		c.handleOnError(response, err, request, ctx)
@@ -788,6 +803,19 @@ func (c *Collector) OnHTML(goquerySelector string, f HTMLCallback) {
 	}
 	c.htmlCallbacks = append(c.htmlCallbacks, &htmlCallbackContainer{
 		Selector: goquerySelector,
+		Function: f,
+	})
+	c.lock.Unlock()
+}
+
+//OnJSON ...
+func (c *Collector) OnJSON(jpathSelector string, f JSONCallback) {
+	c.lock.Lock()
+	if c.jsonCallbacks == nil {
+		c.jsonCallbacks = make([]*jsonCallbackContainer, 0)
+	}
+	c.jsonCallbacks = append(c.jsonCallbacks, &jsonCallbackContainer{
+		Selector: jpathSelector,
 		Function: f,
 	})
 	c.lock.Unlock()
@@ -1048,6 +1076,18 @@ func (c *Collector) handleOnXML(resp *Response) error {
 				cc.Function(e)
 			})
 		}
+	}
+	return nil
+}
+
+func (c *Collector) handleOnJSON(resp *Response) error {
+	if len(c.jsonCallbacks) == 0 {
+		return nil
+	}
+	for _, cc := range c.jsonCallbacks {
+		result := gjson.GetBytes(resp.Body, cc.Selector)
+		e := NewJSONElement(result)
+		cc.Function(e)
 	}
 	return nil
 }

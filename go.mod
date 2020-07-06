@@ -1,6 +1,6 @@
 module github.com/gocolly/colly/v2
 
-go 1.12
+go 1.13
 
 require (
 	github.com/PuerkitoBio/goquery v1.5.0
@@ -12,6 +12,7 @@ require (
 	github.com/kennygrant/sanitize v1.2.4
 	github.com/saintfish/chardet v0.0.0-20120816061221-3af4cd4741ca
 	github.com/temoto/robotstxt v1.1.1
+	github.com/tidwall/gjson v1.4.0
 	golang.org/x/net v0.0.0-20190724013045-ca1201d0de80
 	google.golang.org/appengine v1.6.1
 )
